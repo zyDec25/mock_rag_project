@@ -1,0 +1,57 @@
+services:
+  mock_backend_api:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: mock_backend_api
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      ROOT_PATH: http://localhost:8001
+      DATABASE_URL: postgresql://postgres:pg123456@gsk_pg:5432/gsk
+      REDIS_URL: redis://mock_redis:6379/0
+    depends_on:
+      - gsk_pg
+      - mock_redis
+    ports:
+      - "8001:8000"
+    command: ["uvicorn", "app_main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./app:/app
+    networks:
+      - mock_backend_network
+
+  gsk_pg:
+    image: postgres:15-alpine
+    container_name: mock_gsk_pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: pg123456
+      POSTGRES_DB: gsk
+    ports:
+      - "5433:5432"
+    volumes:
+      - mock_pg_data:/var/lib/postgresql/data
+    networks:
+      - mock_backend_network
+
+  mock_redis:
+    image: redis:6-alpine
+    container_name: mock_backend_redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - mock_redis_data:/data
+    networks:
+      - mock_backend_network
+
+volumes:
+  mock_pg_data:
+    driver: local
+  mock_redis_data:
+    driver: local
+
+networks:
+  mock_backend_network:
+    driver: bridge
