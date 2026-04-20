@@ -1,12 +1,22 @@
 import json
+import time
 import uuid
 from io import BytesIO
 from datetime import datetime, timedelta
-from typing import Generator, List
+from typing import AsyncGenerator, List
 
 import pdfplumber
 from docx import Document
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session as DbSession
 
@@ -30,7 +40,7 @@ from schemas.Session import (
     SessionListResponse,
 )
 from utils.auth import get_current_user
-from utils.database import get_db
+from utils.database import SessionLocal, get_db
 from utils.redis_client import (
     QUICK_PARSE_TTL_SECONDS,
     get_quick_parse_content,
@@ -71,12 +81,16 @@ def _format_message(
         error_message=message.error_message,
         retrieval_time_ms=message.retrieval_time_ms,
         generation_time_ms=message.generation_time_ms,
-        started_at=message.started_at.strftime("%Y-%m-%d %H:%M:%S")
-        if message.started_at
-        else None,
-        completed_at=message.completed_at.strftime("%Y-%m-%d %H:%M:%S")
-        if message.completed_at
-        else None,
+        started_at=(
+            message.started_at.strftime("%Y-%m-%d %H:%M:%S")
+            if message.started_at
+            else None
+        ),
+        completed_at=(
+            message.completed_at.strftime("%Y-%m-%d %H:%M:%S")
+            if message.completed_at
+            else None
+        ),
         created_at=message.created_at.strftime("%Y-%m-%d %H:%M:%S"),
         updated_at=message.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
     )
@@ -245,9 +259,7 @@ def _hydrate_quick_parse_documents(
             continue
 
         current_content = (
-            document.get("content")
-            or document.get("content_with_weight")
-            or ""
+            document.get("content") or document.get("content_with_weight") or ""
         )
         if len(current_content) >= len(quick_parse_content):
             continue
@@ -261,23 +273,121 @@ def _hydrate_quick_parse_documents(
     return json.dumps(documents, ensure_ascii=False)
 
 
-def _sse_data(payload: dict | str) -> str:
+def _sse_event(event: str, payload: dict | str) -> str:
     data = (
-        payload
-        if isinstance(payload, str)
-        else json.dumps(payload, ensure_ascii=False)
+        payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
     )
-    return f"data: {data}\n\n"
+    return f"event: {event}\ndata: {data}\n\n"
 
 
-def _mock_chat_stream(
-    answer: str, documents: list[dict], recommended_questions: list[str]
-) -> Generator[str, None, None]:
-    yield _sse_data({"documents": documents})
-    for index in range(0, len(answer), 18):
-        yield _sse_data({"content": answer[index : index + 18]})
-    yield _sse_data({"recommended_questions": recommended_questions})
-    yield _sse_data("[DONE]")
+def _elapsed_ms(start_time: float) -> int:
+    return max(0, int((time.perf_counter() - start_time) * 1000))
+
+
+async def _mock_chat_stream(
+    message_id: str,
+    session_id: str,
+    user_id: str,
+    question: str,
+) -> AsyncGenerator[str, None]:
+    stream_db = SessionLocal()
+    retrieval_start = time.perf_counter()
+    generation_start = 0.0
+    model_answer = ""
+    documents: list[dict] = []
+    recommended_questions: list[str] = []
+
+    try:
+        message = (
+            stream_db.query(Message).filter(Message.message_id == message_id).first()
+        )
+        if message is None:
+            raise RuntimeError("消息记录不存在")
+
+        message.status = "retrieving"
+        message.started_at = message.started_at or datetime.now()
+        stream_db.commit()
+
+        quick_parse_content = await get_quick_parse_content(session_id)
+        if quick_parse_content:
+            documents.append(
+                _build_quick_parse_reference(session_id, quick_parse_content)
+            )
+
+        retrieval_time_ms = _elapsed_ms(retrieval_start)
+        message.status = "generating"
+        message.documents = json.dumps(documents, ensure_ascii=False)
+        message.retrieval_time_ms = retrieval_time_ms
+        stream_db.commit()
+
+        yield _sse_event("message", {"documents": documents})
+
+        generation_start = time.perf_counter()
+        recommended_questions = _build_recommended_questions(question)
+        model_answer = _build_mock_answer(question, quick_parse_content)
+
+        for index in range(0, len(model_answer), 18):
+            yield _sse_event(
+                "message",
+                {"content": model_answer[index : index + 18]},
+            )
+
+        yield _sse_event(
+            "message",
+            {"recommended_questions": recommended_questions},
+        )
+
+        completed_at = datetime.now()
+        message.model_answer = model_answer
+        message.recommended_questions = json.dumps(
+            recommended_questions, ensure_ascii=False
+        )
+        message.think = "mock 阶段未接入真实推理过程"
+        message.status = "completed"
+        message.generation_time_ms = _elapsed_ms(generation_start)
+        message.completed_at = completed_at
+
+        chat_session = (
+            stream_db.query(ChatSession)
+            .filter(
+                ChatSession.session_id == session_id,
+                ChatSession.user_id == user_id,
+            )
+            .first()
+        )
+        if chat_session and chat_session.session_name == "新对话":
+            chat_session.session_name = _make_session_name(question)
+
+        stream_db.commit()
+        yield _sse_event("end", "[DONE]")
+    except Exception as exc:
+        stream_db.rollback()
+
+        message = (
+            stream_db.query(Message).filter(Message.message_id == message_id).first()
+        )
+        if message is not None:
+            message.status = "failed"
+            message.error_message = str(exc)
+            message.model_answer = model_answer
+            message.documents = json.dumps(documents, ensure_ascii=False)
+            message.recommended_questions = json.dumps(
+                recommended_questions, ensure_ascii=False
+            )
+            message.retrieval_time_ms = (
+                message.retrieval_time_ms
+                if message.retrieval_time_ms is not None
+                else _elapsed_ms(retrieval_start)
+            )
+            if generation_start:
+                message.generation_time_ms = _elapsed_ms(generation_start)
+            message.completed_at = datetime.now()
+            stream_db.commit()
+
+        yield _sse_event("error", {"error": str(exc), "status": "failed"})
+        yield _sse_event("end", "[DONE]")
+    finally:
+        stream_db.close()
 
 
 @router.post("/create_session", response_model=CreateSessionResponse)
@@ -361,40 +471,30 @@ async def chat_on_docs(
             detail="问题不能为空",
         )
 
-    chat_session = _get_owned_session(session_id, current_user, db)
+    _get_owned_session(session_id, current_user, db)
 
-    quick_parse_content = await get_quick_parse_content(session_id)
-    documents: list[dict] = []
-    if quick_parse_content:
-        documents.append(_build_quick_parse_reference(session_id, quick_parse_content))
-    recommended_questions = _build_recommended_questions(question)
-    model_answer = _build_mock_answer(question, quick_parse_content)
-    think = "mock 阶段未接入真实推理过程"
     now = datetime.now()
-
     message = Message(
         session_id=session_id,
         user_question=question,
-        model_answer=model_answer,
-        documents=json.dumps(documents, ensure_ascii=False),
-        recommended_questions=json.dumps(recommended_questions, ensure_ascii=False),
-        think=think,
-        status="completed",
-        retrieval_time_ms=0,
-        generation_time_ms=0,
+        model_answer="",
+        documents=json.dumps([], ensure_ascii=False),
+        recommended_questions=json.dumps([], ensure_ascii=False),
+        think=None,
+        status="pending",
         started_at=now,
-        completed_at=now,
     )
     db.add(message)
-
-    if chat_session.session_name == "新对话":
-        chat_session.session_name = _make_session_name(question)
-
     db.commit()
     db.refresh(message)
 
     return StreamingResponse(
-        _mock_chat_stream(model_answer, documents, recommended_questions),
+        _mock_chat_stream(
+            message_id=message.message_id,
+            session_id=session_id,
+            user_id=str(current_user.id),
+            question=question,
+        ),
         media_type="text/event-stream",
     )
 
