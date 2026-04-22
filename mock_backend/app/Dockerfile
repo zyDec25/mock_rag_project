@@ -22,8 +22,8 @@ RUN apt-get update --fix-missing || apt-get update && \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# 更新 pip 并配置镜像源
-RUN pip config set global.extra-index-url "https://mirrors.cernet.edu.cn/pypi/web/simple"
+# 更新 pip
+RUN pip config unset global.extra-index-url || true
 RUN pip install --upgrade pip setuptools wheel
 
 # 设置工作目录
@@ -31,7 +31,7 @@ WORKDIR /app
 
 # 拷贝依赖文件并安装
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --index-url https://pypi.org/simple -r requirements.txt
 
 # 拷贝代码
 COPY . /app

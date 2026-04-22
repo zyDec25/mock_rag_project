@@ -11,6 +11,8 @@ services:
       ROOT_PATH: http://localhost:8001
       DATABASE_URL: postgresql://postgres:pg123456@gsk_pg:5432/gsk
       REDIS_URL: redis://mock_redis:6379/0
+      MINERU_MODEL_SOURCE: modelscope
+      HF_ENDPOINT: https://hf-mirror.com
     depends_on:
       - gsk_pg
       - mock_redis
