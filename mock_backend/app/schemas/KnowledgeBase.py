@@ -6,6 +6,7 @@ from pydantic import BaseModel
 class KnowledgeBaseFileResponse(BaseModel):
     user_id: str
     file_name: str
+    status: str = "uploaded"
     created_at: str
     updated_at: str
 
